@@ -128,3 +128,181 @@
         (ok true)
     )
 )
+
+;; Allows users to stake STX tokens with an optional lock period
+(define-public (stake-stx (amount uint) (lock-period uint))
+    (let
+        (
+            (current-position (default-to 
+                {
+                    total-collateral: u0,
+                    total-debt: u0,
+                    health-factor: u0,
+                    last-updated: u0,
+                    stx-staked: u0,
+                    analytics-tokens: u0,
+                    voting-power: u0,
+                    tier-level: u0,
+                    rewards-multiplier: u100
+                }
+                (map-get? UserPositions tx-sender)))
+        )
+        (asserts! (is-valid-lock-period lock-period) ERR-INVALID-PROTOCOL)
+        (asserts! (not (var-get contract-paused)) ERR-PAUSED)
+        (asserts! (>= amount (var-get minimum-stake)) ERR-BELOW-MINIMUM)
+        
+        ;; Transfer STX to contract
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        ;; Calculate tier level and multiplier
+        (let
+            (
+                (new-total-stake (+ (get stx-staked current-position) amount))
+                (tier-info (get-tier-info new-total-stake))
+                (lock-multiplier (calculate-lock-multiplier lock-period))
+            )
+            
+            ;; Update staking position
+            (map-set StakingPositions
+                tx-sender
+                {
+                    amount: amount,
+                    start-block: stacks-block-height,
+                    last-claim: stacks-block-height,
+                    lock-period: lock-period,
+                    cooldown-start: none,
+                    accumulated-rewards: u0
+                }
+            )
+            
+            ;; Update user position with new tier info
+            (map-set UserPositions
+                tx-sender
+                (merge current-position
+                    {
+                        stx-staked: new-total-stake,
+                        tier-level: (get tier-level tier-info),
+                        rewards-multiplier: (* (get reward-multiplier tier-info) lock-multiplier)
+                    }
+                )
+            )
+            
+            ;; Update STX pool
+            (var-set stx-pool (+ (var-get stx-pool) amount))
+            (ok true)
+        )
+    )
+)
+
+;; Initiates the unstaking process by setting a cooldown period
+(define-public (initiate-unstake (amount uint))
+    (let
+        (
+            (staking-position (unwrap! (map-get? StakingPositions tx-sender) ERR-NO-STAKE))
+            (current-amount (get amount staking-position))
+        )
+        (asserts! (>= current-amount amount) ERR-INSUFFICIENT-STX)
+        (asserts! (is-none (get cooldown-start staking-position)) ERR-COOLDOWN-ACTIVE)
+        
+        ;; Update staking position with cooldown
+        (map-set StakingPositions
+            tx-sender
+            (merge staking-position
+                {
+                    cooldown-start: (some stacks-block-height)
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Completes the unstaking process after the cooldown period
+(define-public (complete-unstake)
+    (let
+        (
+            (staking-position (unwrap! (map-get? StakingPositions tx-sender) ERR-NO-STAKE))
+            (cooldown-start (unwrap! (get cooldown-start staking-position) ERR-NOT-AUTHORIZED))
+        )
+        (asserts! (>= (- stacks-block-height cooldown-start) (var-get cooldown-period)) ERR-COOLDOWN-ACTIVE)
+        
+        ;; Transfer STX back to user
+        (try! (as-contract (stx-transfer? (get amount staking-position) tx-sender tx-sender)))
+        
+        ;; Clear staking position
+        (map-delete StakingPositions tx-sender)
+        
+        (ok true)
+    )
+)
+
+;; Allows users to create a governance proposal
+(define-public (create-proposal (description (string-utf8 256)) (voting-period uint))
+    (let
+        (
+            (user-position (unwrap! (map-get? UserPositions tx-sender) ERR-NOT-AUTHORIZED))
+            (proposal-id (+ (var-get proposal-count) u1))
+        )
+        (asserts! (>= (get voting-power user-position) u1000000) ERR-NOT-AUTHORIZED)
+        (asserts! (is-valid-description description) ERR-INVALID-PROTOCOL)
+        (asserts! (is-valid-voting-period voting-period) ERR-INVALID-PROTOCOL)
+        
+        (map-set Proposals { proposal-id: proposal-id }
+            {
+                creator: tx-sender,
+                description: description,
+                start-block: stacks-block-height,
+                end-block: (+ stacks-block-height voting-period),
+                executed: false,
+                votes-for: u0,
+                votes-against: u0,
+                minimum-votes: u1000000
+            }
+        )
+        
+        (var-set proposal-count proposal-id)
+        (ok proposal-id)
+    )
+)
+
+;; Allows users to vote on a governance proposal
+(define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
+    (let
+        (
+            (proposal (unwrap! (map-get? Proposals { proposal-id: proposal-id }) ERR-INVALID-PROTOCOL))
+            (user-position (unwrap! (map-get? UserPositions tx-sender) ERR-NOT-AUTHORIZED))
+            (voting-power (get voting-power user-position))
+            (max-proposal-id (var-get proposal-count))
+        )
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (> proposal-id u0) (<= proposal-id max-proposal-id)) ERR-INVALID-PROTOCOL)
+        
+        (map-set Proposals { proposal-id: proposal-id }
+            (merge proposal
+                {
+                    votes-for: (if vote-for (+ (get votes-for proposal) voting-power) (get votes-for proposal)),
+                    votes-against: (if vote-for (get votes-against proposal) (+ (get votes-against proposal) voting-power))
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Pauses the contract, disabling certain functions
+(define-public (pause-contract)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set contract-paused true)
+        (ok true)
+    )
+)
+
+;; Resumes the contract, re-enabling certain functions
+(define-public (resume-contract)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (var-set contract-paused false)
+        (ok true)
+    )
+)
